@@ -255,6 +255,7 @@ async def as_yielded(*iterators: AsyncIterator[T]) -> AsyncIterator[T]:  # type:
             queue.task_done()
             if isinstance(item, _Done):
                 assert queue.empty()
+                await task
                 del task
                 del queue
                 if item._exc:
