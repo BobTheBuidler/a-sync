@@ -4,9 +4,8 @@ exhaust async iterators, merge multiple async iterators into a single async iter
 flow of items in an asynchronous context.
 """
 
-import asyncio
-import asyncio.futures
 import traceback
+from asyncio import CancelledError, Queue, Task, gather, sleep
 from logging import DEBUG, getLogger
 from types import TracebackType
 
@@ -15,11 +14,11 @@ from a_sync._typing import *
 from a_sync.primitives.queue import Queue
 
 logger = getLogger(__name__)
+_logger_is_enabled_for = logger.isEnabledFor
+_logger_log = logger._log
 
 
-async def exhaust_iterator(
-    iterator: AsyncIterator[T], *, queue: Optional[asyncio.Queue] = None
-) -> None:
+async def exhaust_iterator(iterator: AsyncIterator[T], *, queue: Optional[Queue] = None) -> None:
     """
     Asynchronously iterates over items from the given async iterator and optionally places them into a queue.
 
@@ -28,8 +27,8 @@ async def exhaust_iterator(
     to be consumed by other parts of an application, enabling a producer-consumer pattern.
 
     Args:
-        iterator (AsyncIterator[T]): The async iterator to exhaust.
-        queue (Optional[asyncio.Queue]): An optional queue-like object where iterated items will be placed.
+        iterator: The async iterator to exhaust.
+        queue: An optional queue-like object where iterated items will be placed.
             The queue should support the `put_nowait` method. If None, items are simply consumed.
 
     Example:
@@ -40,20 +39,32 @@ async def exhaust_iterator(
         - :func:`exhaust_iterators`
         - :func:`as_yielded`
     """
+    done = 0
+
+    async def unblock_loop():
+        nonlocal done
+        done += 1
+        if done % 1000 == 0:
+            await sleep(0)
+
     if queue is None:
         async for thing in iterator:
-            pass
-    elif logger.isEnabledFor(DEBUG):
-        async for thing in iterator:
-            logger._log(DEBUG, "putting %s from %s to queue %s", (thing, iterator, queue))
-            queue.put_nowait(thing)
+            await unblock_loop()
     else:
-        async for thing in iterator:
-            queue.put_nowait(thing)
+        put_nowait = queue.put_nowait
+        if _logger_is_enabled_for(DEBUG):
+            async for thing in iterator:
+                _logger_log(DEBUG, "putting %s from %s to queue %s", (thing, iterator, queue))
+                put_nowait(thing)
+                await unblock_loop()
+        else:
+            async for thing in iterator:
+                put_nowait(thing)
+                await unblock_loop()
 
 
 async def exhaust_iterators(
-    iterators, *, queue: Optional[asyncio.Queue] = None, join: bool = False
+    iterators, *, queue: Optional[Queue] = None, join: bool = False
 ) -> None:
     """
     Asynchronously iterates over multiple async iterators concurrently and optionally places their items into a queue.
@@ -63,8 +74,8 @@ async def exhaust_iterators(
 
     Args:
         iterators: A sequence of async iterators to be exhausted concurrently.
-        queue (Optional[Queue]): An optional queue-like object where items from all iterators will be placed. If None, items are simply consumed.
-        join (Optional[bool]): If a queue was provided and join is True, this coroutine will continue to run until all queue items have been processed.
+        queue: An optional queue-like object where items from all iterators will be placed. If None, items are simply consumed.
+        join: If a queue was provided and join is True, this coroutine will continue to run until all queue items have been processed.
 
     Raises:
         ValueError: If `join` is True but no `queue` is provided.
@@ -80,7 +91,7 @@ async def exhaust_iterators(
     if queue is None and join:
         raise ValueError("You must provide a `queue` to use kwarg `join`")
 
-    for x in await asyncio.gather(
+    for x in await gather(
         *[exhaust_iterator(iterator, queue=queue) for iterator in iterators],
         return_exceptions=True,
     ):
@@ -228,7 +239,7 @@ async def as_yielded(*iterators: AsyncIterator[T]) -> AsyncIterator[T]:  # type:
     # hypothesis idea: _Done should never be exposed to user, works for all desired input types
     queue: Queue[Union[T, _Done]] = Queue()
 
-    def _as_yielded_done_callback(t: asyncio.Task) -> None:
+    def _as_yielded_done_callback(t: Task) -> None:
         if t.cancelled():
             return
         if e := t.exception():
@@ -243,16 +254,20 @@ async def as_yielded(*iterators: AsyncIterator[T]) -> AsyncIterator[T]:  # type:
 
     task.add_done_callback(_as_yielded_done_callback)
 
-    while not task.done():
+    done = task.done
+    get_all_from_queue = queue.get_all
+    mark_done = queue.task_done
+
+    while not done():
         try:
-            items = await queue.get_all()
-        except asyncio.CancelledError:
+            items = await get_all_from_queue()
+        except CancelledError:
             # cleanup lingering objects and reraise
             del task
             del queue
             raise
         for item in items:
-            queue.task_done()
+            mark_done()
             if isinstance(item, _Done):
                 assert queue.empty()
                 del task
