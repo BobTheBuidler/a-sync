@@ -18,9 +18,7 @@ _logger_is_enabled_for = logger.isEnabledFor
 _logger_log = logger._log
 
 
-async def exhaust_iterator(
-    iterator: AsyncIterator[T], *, queue: Optional[Queue] = None
-) -> None:
+async def exhaust_iterator(iterator: AsyncIterator[T], *, queue: Optional[Queue] = None) -> None:
     """
     Asynchronously iterates over items from the given async iterator and optionally places them into a queue.
 
@@ -42,13 +40,13 @@ async def exhaust_iterator(
         - :func:`as_yielded`
     """
     done = 0
-    
+
     async def unblock_loop():
         nonlocal done
         done += 1
         if done % 1000 == 0:
             await sleep(0)
-            
+
     if queue is None:
         async for thing in iterator:
             await unblock_loop()
